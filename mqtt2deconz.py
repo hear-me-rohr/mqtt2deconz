@@ -4,6 +4,7 @@ from cachetools.func import ttl_cache
 from hashable_cache import hashable_cache
 from hbmqtt.mqtt.constants import QOS_0
 from hbmqtt.client import MQTTClient, ConnectException, ClientException
+from asyncio import IncompleteReadError
 import json
 import asyncio
 import requests
@@ -23,23 +24,23 @@ def get_from_dict(config: dict, name: str, default = None):
             config = result if len(names) > 0 else None
     return result if result is not None else default
 
-@hashable_cache(ttl_cache(maxsize=128, ttl=300))
+@hashable_cache(ttl_cache(maxsize=128, ttl=600))
 def get_cached_devices(config: dict):
     log = logging.getLogger('mqtt2deconz.get_cached_devices')
-    log.info('Requesting devices from deCONZ')
-    
+    log.debug('Requesting devices from deCONZ')
+
     endpoint = str(get_from_dict(config, 'deconz.uri')) + '/api/' + str(get_from_dict(config, 'deconz.apikey')) + '/lights'
     r = requests.get(url=endpoint)
-    
+
     if r is None or r == '':
         log.warn('I got a null or empty string value for data from deconz')
         return []
-    
+
     data = r.json()
     if not isinstance(data, dict):
         log.warn('Error. Check if deconz.apikey was provided in the configuration yaml.')
         return []
-        
+
     return data.keys()
 
 async def mqtt_subscriber(config: dict, message_queue: asyncio.Queue) -> None:
@@ -50,48 +51,50 @@ async def mqtt_subscriber(config: dict, message_queue: asyncio.Queue) -> None:
     # Connecting to MQTT
     try:
         await mqtt.connect(uri=get_from_dict(config, 'mqtt.client.uri'), cleansession=get_from_dict(config, 'mqtt.client.cleansession'))
-    except ConnectException as ce:
+    except (IncompleteReadError, ConnectException) as ce:
         log.error('Can\'t connect to MQTT: {}'.format(ce))
-        return
+        raise SystemExit('Let\'s hope systectl will restart me...')
     log.info('Connected to MQTT')
-    
+
     # Getting device topic tuples list
     prefix = str(get_from_dict(config, 'mqtt.topic_prefix'))
     device_topics = [prefix + '/lights/' + key + '/cmnd' for key in get_cached_devices(config)]
-    
-    # Subscribing to topics for every device received from discovery
-    await mqtt.subscribe(list(zip(device_topics, [QOS_0] * len(device_topics))))
-    
-    # Pattern to isolate device number
-    p = re.compile('deconz\/lights\/(\d+)\/cmnd')
 
-    # Waiting for messages
-    while True:
-        try:
+    # Subscribing to topics for every device received from discovery
+    try:
+        await mqtt.subscribe(list(zip(device_topics, [QOS_0] * len(device_topics))))
+        log.info('Subscribed to topics: ' + str(device_topics))
+
+        # Pattern to isolate device number
+        p = re.compile('deconz\/lights\/(\d+)\/cmnd')
+
+        # Waiting for messages
+        while True:
             try:
-                message = await mqtt.deliver_message()
+                message = await mqtt.deliver_message(timeout=180)
                 packet = message.publish_packet
                 device_id = p.match(packet.variable_header.topic_name).group(1)
                 message_data = packet.payload.data
-                
+
                 log.debug('Got message: {}'.format(message_data))
                 log.debug('Got device id: {}'.format(device_id))
-                
+
                 message_json = json.loads(message_data)
                 message_json['type'] = 'lights'
                 message_json['id'] = device_id
 
                 message_queue.put_nowait(json.dumps(message_json, indent = 0))
             except asyncio.TimeoutError as te:
-                log.info('Timeout. Refreshing subscription')
+                log.debug('Timeout. Refreshing subscription')
                 await mqtt.unsubscribe(device_topics)
                 device_topics = [prefix + '/lights/' + key + '/cmnd' for key in get_cached_devices(config)]
                 await mqtt.subscribe(list(zip(device_topics, [QOS_0] * len(device_topics))))
-        except (ClientException, AttributeError) as error:
-            log.error('Client exception to MQTT occurred')
-            asyncio.sleep(60)
-    await mqtt.unsubscribe(device_topics)
-    await mqtt.disconnect()
+        await mqtt.unsubscribe(device_topics)
+        await mqtt.disconnect()
+
+    except (ClientException, AttributeError, IncompleteReadError) as anerror:
+        log.error('Client exception to MQTT occurred')
+        raise SystemExit('Let\'s hope systectl will restart me...')
 
 async def deconz_message_writer(config: dict, message_queue: asyncio.Queue) -> None:
     log = logging.getLogger('deconz2mqtt.deconz_message_writer')
@@ -100,13 +103,13 @@ async def deconz_message_writer(config: dict, message_queue: asyncio.Queue) -> N
         message = await message_queue.get()
         message_json = json.loads(message)
         filtered_message_json = {k: v for k, v in message_json.items() if k in ['on', 'bri']}
-        
+
         id = message_json.get('id', None)
         if 'toggle' in message_json.keys():
             # get current on status
             endpoint = str(get_from_dict(config, 'deconz.uri')) + '/api/' + str(get_from_dict(config, 'deconz.apikey')) + '/lights/' + str(id)
             filtered_message_json['on'] = not get_from_dict(requests.get(url=endpoint).json(), 'state.on')
-        
+
         endpoint = str(get_from_dict(config, 'deconz.uri')) + '/api/' + str(get_from_dict(config, 'deconz.apikey')) + '/lights/' + str(id) + '/state'
         requests.put(endpoint, data=json.dumps(filtered_message_json, indent = 0), headers=headers)
 
