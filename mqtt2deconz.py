@@ -28,20 +28,36 @@ def get_from_dict(config: dict, name: str, default = None):
 def get_cached_devices(config: dict):
     log = logging.getLogger('mqtt2deconz.get_cached_devices')
     log.debug('Requesting devices from deCONZ')
+    
+    device_type_to_device_keys = {}
+    for device_type in ['lights', 'groups']:
+        endpoint = str(get_from_dict(config, 'deconz.uri')) + '/api/' + str(get_from_dict(config, 'deconz.apikey')) + '/' + device_type
+        r = requests.get(url=endpoint)
 
-    endpoint = str(get_from_dict(config, 'deconz.uri')) + '/api/' + str(get_from_dict(config, 'deconz.apikey')) + '/lights'
-    r = requests.get(url=endpoint)
+        if r is None or r == '':
+            log.warn('I got a null or empty string value for data from deconz')
+            continue
 
-    if r is None or r == '':
-        log.warn('I got a null or empty string value for data from deconz')
-        return []
+        data = r.json()
+        if not isinstance(data, dict):
+            log.warn('Error. Check if deconz.apikey was provided in the configuration yaml.')
+            continue
+            
+        device_type_to_device_keys[device_type] = data.keys()
+    log.debug('Retrieved devices: ' + str(device_type_to_device_keys))
+    return device_type_to_device_keys
 
-    data = r.json()
-    if not isinstance(data, dict):
-        log.warn('Error. Check if deconz.apikey was provided in the configuration yaml.')
-        return []
 
-    return data.keys()
+def extract_device_topics(config: dict, prefix: str):
+    log = logging.getLogger('mqtt2deconz.extract_device_topics')
+    devices = get_cached_devices(config)
+    device_topics = []
+    for device_type in devices.keys():
+        device_topics.extend([[prefix + '/' + device_type + '/' + device_id + '/cmnd' for device_id in devices[device_type]]])
+    flattened_device_topics = [item for sublist in device_topics for item in sublist]
+    log.debug('Retrieved device topics: ' + str(flattened_device_topics))
+    return flattened_device_topics
+
 
 async def mqtt_subscriber(config: dict, message_queue: asyncio.Queue) -> None:
     log = logging.getLogger('mqtt2deconz.mqtt_subscriber')
@@ -58,7 +74,7 @@ async def mqtt_subscriber(config: dict, message_queue: asyncio.Queue) -> None:
 
     # Getting device topic tuples list
     prefix = str(get_from_dict(config, 'mqtt.topic_prefix'))
-    device_topics = [prefix + '/lights/' + key + '/cmnd' for key in get_cached_devices(config)]
+    device_topics = extract_device_topics(config, prefix)
 
     # Subscribing to topics for every device received from discovery
     try:
@@ -66,28 +82,30 @@ async def mqtt_subscriber(config: dict, message_queue: asyncio.Queue) -> None:
         log.info('Subscribed to topics: ' + str(device_topics))
 
         # Pattern to isolate device number
-        p = re.compile('deconz\/lights\/(\d+)\/cmnd')
+        p = re.compile('deconz\/(groups|lights)\/(\d+)\/cmnd')
 
         # Waiting for messages
         while True:
             try:
                 message = await mqtt.deliver_message(timeout=180)
                 packet = message.publish_packet
-                device_id = p.match(packet.variable_header.topic_name).group(1)
+                device_type = p.match(packet.variable_header.topic_name).group(1)
+                device_id = p.match(packet.variable_header.topic_name).group(2)
                 message_data = packet.payload.data
 
-                log.debug('Got message: {}'.format(message_data))
-                log.debug('Got device id: {}'.format(device_id))
+                log.info('Got message: {}'.format(message_data))
+                log.info('Got device type: {}'.format(device_type))
+                log.info('Got device id: {}'.format(device_id))
 
                 message_json = json.loads(message_data)
-                message_json['type'] = 'lights'
+                message_json['type'] = device_type
                 message_json['id'] = device_id
 
                 message_queue.put_nowait(json.dumps(message_json, indent = 0))
             except asyncio.TimeoutError as te:
                 log.debug('Timeout. Refreshing subscription')
                 await mqtt.unsubscribe(device_topics)
-                device_topics = [prefix + '/lights/' + key + '/cmnd' for key in get_cached_devices(config)]
+                device_topics = extract_device_topics(config, prefix)
                 await mqtt.subscribe(list(zip(device_topics, [QOS_0] * len(device_topics))))
         await mqtt.unsubscribe(device_topics)
         await mqtt.disconnect()
