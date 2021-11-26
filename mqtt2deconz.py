@@ -14,6 +14,14 @@ import io
 import argparse
 import re
 
+
+device_types = ['lights', 'groups']
+device_type_and_id_regex = 'deconz\/(lights|groups)\/(\d+)\/cmnd'
+deconz_uri = 'deconz.uri'
+deconz_apikey = 'deconz.apikey'
+headers = {'Content-Type': 'application/json'}
+
+
 def get_from_dict(config: dict, name: str, default = None):
     names = name.split('.')
     result = None
@@ -24,13 +32,14 @@ def get_from_dict(config: dict, name: str, default = None):
             config = result if len(names) > 0 else None
     return result if result is not None else default
 
+
 @hashable_cache(ttl_cache(maxsize=128, ttl=600))
 def get_cached_devices(config: dict):
     log = logging.getLogger('mqtt2deconz.get_cached_devices')
     log.debug('Requesting devices from deCONZ')
     
     device_type_to_device_keys = {}
-    for device_type in ['lights', 'groups']:
+    for device_type in device_types:
         endpoint = str(get_from_dict(config, 'deconz.uri')) + '/api/' + str(get_from_dict(config, 'deconz.apikey')) + '/' + device_type
         r = requests.get(url=endpoint)
 
@@ -53,7 +62,7 @@ def extract_device_topics(config: dict, prefix: str):
     devices = get_cached_devices(config)
     device_topics = []
     for device_type in devices.keys():
-        device_topics.extend([[prefix + '/' + device_type + '/' + device_id + '/cmnd' for device_id in devices[device_type]]])
+        device_topics.extend([['/'.join([prefix, device_type, device_id, 'cmnd']) for device_id in devices[device_type]]])
     flattened_device_topics = [item for sublist in device_topics for item in sublist]
     log.debug('Retrieved device topics: ' + str(flattened_device_topics))
     return flattened_device_topics
@@ -82,7 +91,7 @@ async def mqtt_subscriber(config: dict, message_queue: asyncio.Queue) -> None:
         log.info('Subscribed to topics: ' + str(device_topics))
 
         # Pattern to isolate device number
-        p = re.compile('deconz\/(groups|lights)\/(\d+)\/cmnd')
+        p = re.compile(device_type_and_id_regex)
 
         # Waiting for messages
         while True:
@@ -114,28 +123,46 @@ async def mqtt_subscriber(config: dict, message_queue: asyncio.Queue) -> None:
         log.error('Client exception to MQTT occurred')
         raise SystemExit('Let\'s hope systectl will restart me...')
 
+
+def deconz_change_groups(config: dict, do_toggle: bool, an_id: int, message_json: dict):
+    endpoint = '/'.join([str(get_from_dict(config, deconz_uri)), 'api', str(get_from_dict(config, deconz_apikey)), 'groups', str(an_id), 'action'])
+    if do_toggle:
+        filtered_message_json = {k: v for k, v in message_json.items() if k in ['toggle']}
+    else:    
+        filtered_message_json = {k: v for k, v in message_json.items() if k in ['on', 'bri']}
+    requests.put(endpoint, data=json.dumps(filtered_message_json, indent = 0), headers=headers)
+
+
+def deconz_change_lights(config: dict, do_toggle: bool, an_id: int, message_json: dict):
+    filtered_message_json = {k: v for k, v in message_json.items() if k in ['on', 'bri']}
+    if do_toggle:
+        # GET current on status
+        get_endpoint = '/'.join([str(get_from_dict(config, deconz_uri)), 'api', str(get_from_dict(config, deconz_apikey)), 'lights', str(an_id)])
+        filtered_message_json['on'] = not get_from_dict(requests.get(url=get_endpoint).json(), 'state.on')
+    put_endpoint = '/'.join([str(get_from_dict(config, deconz_uri)), 'api', str(get_from_dict(config, deconz_apikey)), 'lights', str(an_id), 'state'])
+    requests.put(put_endpoint, data=json.dumps(filtered_message_json, indent = 0), headers=headers)
+
+
 async def deconz_message_writer(config: dict, message_queue: asyncio.Queue) -> None:
     log = logging.getLogger('deconz2mqtt.deconz_message_writer')
-    headers = {'Content-Type': 'application/json'}
     while True:
         message = await message_queue.get()
-        message_json = json.loads(message)
-        filtered_message_json = {k: v for k, v in message_json.items() if k in ['on', 'bri']}
-
-        id = message_json.get('id', None)
-        if 'toggle' in message_json.keys():
-            # get current on status
-            endpoint = str(get_from_dict(config, 'deconz.uri')) + '/api/' + str(get_from_dict(config, 'deconz.apikey')) + '/lights/' + str(id)
-            filtered_message_json['on'] = not get_from_dict(requests.get(url=endpoint).json(), 'state.on')
-
-        endpoint = str(get_from_dict(config, 'deconz.uri')) + '/api/' + str(get_from_dict(config, 'deconz.apikey')) + '/lights/' + str(id) + '/state'
-        requests.put(endpoint, data=json.dumps(filtered_message_json, indent = 0), headers=headers)
+        message_json = json.loads(message)        
+        do_toggle = 'toggle' in message_json.keys()
+        an_id = message_json.get('id', None)        
+        
+        if (message_json.get('type', None) == 'lights'):
+            deconz_change_lights(config, do_toggle, an_id, message_json)
+        else:
+            deconz_change_groups(config, do_toggle, an_id, message_json)
+        
 
 async def main(config: dict):
     message_queue = asyncio.Queue(10)
     mqtt = asyncio.create_task(mqtt_subscriber(config, message_queue))
     deconz = asyncio.create_task(deconz_message_writer(config, message_queue))
     done, pending = await asyncio.wait([mqtt, deconz], return_when=asyncio.FIRST_EXCEPTION)
+    
     for task in done:
         task.result()
     for task in pending:
@@ -157,5 +184,5 @@ if __name__ == "__main__":
         datefmt='%Y-%m-%d %H:%M:%S')
     for logger_name, logger_level in get_from_dict(config, 'logging', {}).items():
         logging.getLogger(None if logger_name == 'root' else logger_name).setLevel(logger_level)
-
+        
     asyncio.run(main(config))
